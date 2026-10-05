@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Private working notes, kept out of the public repo
+CLAUDE.md
+.claude/
+
+# Backups and editor leftovers
+*.bak
+*.bak-*
+*~
