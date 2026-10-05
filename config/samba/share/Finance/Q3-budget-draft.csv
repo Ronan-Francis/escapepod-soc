@@ -1,0 +1,3 @@
+# DECOY FILE - not real data. Part of a honeypot; opening it is logged.
+department,quarter,amount
+example,Q3,0

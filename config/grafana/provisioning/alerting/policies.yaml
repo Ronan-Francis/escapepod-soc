@@ -1,0 +1,11 @@
+# Every alert goes to email-me. Short group_wait so an alert lands within a
+# minute; repeat_interval stops a still-firing rule from emailing constantly.
+apiVersion: 1
+
+policies:
+  - orgId: 1
+    receiver: email-me
+    group_by: ["alertname"]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 4h

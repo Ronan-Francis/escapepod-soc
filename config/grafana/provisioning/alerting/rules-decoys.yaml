@@ -1,0 +1,88 @@
+# Decoy alerts. Nothing legitimate ever talks to a decoy, so a single event
+# is enough to alert. Evaluated every 30s over the last minute, so an event
+# reaches the inbox in well under a minute (plus group_wait in policies.yaml).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: decoys
+    folder: escapepod-soc
+    interval: 30s
+    rules:
+      # OpenCanary: SSH (22), FTP (21), HTTP login page (80).
+      # service=~"ssh|ftp|http" leaves out OpenCanary's own startup and
+      # heartbeat events (logtype 1000-1006, service="opencanary").
+      - uid: decoy-opencanary
+        title: Decoy touched (SSH/FTP/HTTP)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              editorMode: code
+              queryType: instant
+              expr: >-
+                sum by (service, src_host, username, password) (
+                  count_over_time({job="opencanary", service=~"ssh|ftp|http"}
+                    | json username="logdata.USERNAME", password="logdata.PASSWORD" [1m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: high
+          mitre: T1110   # Brute Force (credential guessing against a service)
+        annotations:
+          summary: 'Decoy {{ $labels.service }} touched from {{ $labels.src_host }}'
+          description: 'service={{ $labels.service }} source={{ $labels.src_host }} username={{ $labels.username }} password={{ $labels.password }}'
+
+      # Samba decoy share (445). One JSON line per login attempt; SMB never
+      # sends the password, so we get username + client machine name instead.
+      - uid: decoy-smb
+        title: Decoy touched (SMB file share)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              editorMode: code
+              queryType: instant
+              expr: >-
+                sum by (src, user, workstation, status) (
+                  count_over_time({service="smb-decoy"} |= "\"type\": \"Authentication\""
+                    | json src="Authentication.remoteAddress", user="Authentication.clientAccount",
+                           workstation="Authentication.workstation", status="Authentication.status" [1m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: high
+          mitre: T1021.002   # Remote Services: SMB/Windows Admin Shares
+        annotations:
+          summary: 'Decoy SMB share touched from {{ $labels.src }}'
+          description: 'source={{ $labels.src }} username={{ $labels.user }} workstation={{ $labels.workstation }} result={{ $labels.status }}'

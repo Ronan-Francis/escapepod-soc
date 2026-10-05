@@ -1,0 +1,151 @@
+# escapepod-soc: log collection and alerting on a Raspberry Pi 5.
+#
+# Every published port is bound to 127.0.0.1 on purpose: Docker-published
+# ports bypass ufw, so anything bound to 0.0.0.0 would be on the family LAN.
+# Reach Grafana from your PC with an SSH tunnel:
+#   ssh -p 2222 -N -L 3000:127.0.0.1:3000 pi@<pi-hostname>
+#
+# Container log size limits come from /etc/docker/daemon.json (json-file, 10m x 3).
+
+name: escapepod-soc
+
+services:
+  loki:
+    image: grafana/loki:3.7.8
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./config/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - /srv/soc-data/loki:/loki
+    networks: [soc]
+    mem_limit: 1g
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # Lets Alloy list containers and read their logs, and refuses every other
+  # Docker API call. Direct access to docker.sock is effectively root on the Pi.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1   # GET /containers/... (list, inspect, logs)
+      NETWORKS: 1     # GET /networks: discovery.docker uses it for network labels
+      POST: 0         # read-only: no create/start/stop/exec
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [dockerapi]
+    mem_limit: 64m
+    security_opt: ["no-new-privileges:true"]
+
+  alloy:
+    image: grafana/alloy:v1.20.1
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    restart: unless-stopped
+    # Sets the "host" label on every log line (Alloy's constants.hostname).
+    hostname: ${PI_HOSTNAME:-pi}
+    # Unprivileged alloy user from the image, plus the host's systemd-journal
+    # group so it can read the journal and nothing else.
+    user: "473:473"
+    group_add: ["${JOURNAL_GID:-999}"]
+    ports:
+      - "127.0.0.1:12345:12345"   # Alloy debug UI
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /srv/soc-data/alloy:/var/lib/alloy/data
+      - /run/log/journal:/run/log/journal:ro   # journald is volatile (in RAM) on this Pi
+      - /etc/machine-id:/etc/machine-id:ro
+      - /srv/soc-data/opencanary:/var/log/opencanary:ro
+    networks: [soc, dockerapi]
+    depends_on: [loki, socket-proxy]
+    mem_limit: 512m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # Only applied the first time Grafana creates its database.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Don't download or auto-update plugins at startup: run only what ships
+      # in the pinned image (Loki support is built in).
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      # Email alerts via Gmail, from a dedicated sender account (see .env.example).
+      # MandatoryStartTLS: refuse to send if the connection can't be encrypted.
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: smtp.gmail.com:587
+      GF_SMTP_USER: ${SMTP_USER:?set SMTP_USER in .env}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD:?set SMTP_PASSWORD in .env}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_USER}
+      GF_SMTP_FROM_NAME: escapepod SOC
+      GF_SMTP_STARTTLS_POLICY: MandatoryStartTLS
+      GF_SMTP_SKIP_VERIFY: "false"
+      # Read by provisioning/alerting/contact-points.yaml
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:?set ALERT_EMAIL_TO in .env}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - /srv/soc-data/grafana:/var/lib/grafana
+    networks: [soc]
+    depends_on: [loki]
+    mem_limit: 512m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # Decoy SSH (22), FTP (21) and HTTP login page (80). Host networking so it
+  # sees real source addresses; ufw limits these ports to the LAN.
+  opencanary:
+    image: thinkst/opencanary:0.9.10
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config/opencanary/opencanary.conf:/etc/opencanaryd/opencanary.conf:ro
+      - /srv/soc-data/opencanary:/var/log/opencanary   # owned by nobody:473 (alloy)
+    # twistd's pidfile lives in /run. Docker restarts (not recreates) containers
+    # at boot, so a stale pidfile could match a new process's PID and twistd
+    # would refuse to start ("Another twistd server is running"). In-memory /run
+    # is empty on every start.
+    tmpfs:
+      - /run
+    mem_limit: 256m
+    # Starts as root to bind ports below 1024 and open its log, then twistd
+    # switches to nobody:nogroup and every capability is dropped.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+
+  # Decoy SMB file share (445): real Samba, read-only bait share, no NetBIOS
+  # so it never advertises itself. Logs (JSON logins + file audit) go to
+  # stdout, which Alloy already collects via the socket proxy.
+  smb-decoy:
+    build: ./docker/samba-decoy
+    image: escapepod-soc/samba-decoy:4.17.12-deb12u4
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config/samba/smb.conf:/etc/samba/smb.conf:ro
+      - ./config/samba/share:/srv/decoy-share:ro
+    mem_limit: 256m
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  soc: {}
+  # No route out to the internet; only Alloy and the proxy are on it.
+  dockerapi:
+    internal: true

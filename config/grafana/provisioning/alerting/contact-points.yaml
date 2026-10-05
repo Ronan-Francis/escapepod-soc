@@ -1,0 +1,13 @@
+# Where alerts go. The address comes from .env (ALERT_EMAIL_TO), never the repo.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: email-me
+    receivers:
+      - uid: email-me
+        type: email
+        settings:
+          addresses: ${ALERT_EMAIL_TO}
+          singleEmail: true
+        disableResolveMessage: true   # decoy hits don't "resolve"; one email per event

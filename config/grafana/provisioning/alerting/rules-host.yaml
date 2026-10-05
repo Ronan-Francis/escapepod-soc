@@ -1,0 +1,162 @@
+# Host alerts from the Pi's own journal (no rsyslog/auth.log on this Pi).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: host
+    folder: escapepod-soc
+    interval: 1m
+    rules:
+      # Real sshd (port 2222, key-only). With passwords off, a guesser shows up
+      # as "Invalid user" (unknown name) or "Connection closed by
+      # authenticating user" (real name, no valid key). Grouped by source.
+      - uid: host-ssh-bruteforce
+        title: Repeated failed SSH logins (real sshd)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              editorMode: code
+              queryType: instant
+              expr: >-
+                sum by (src) (
+                  count_over_time({job="journal", syslog_identifier=~"sshd|sshd-session"}
+                    |~ "Invalid user |Connection closed by authenticating user |Failed (password|publickey) for "
+                    | regexp `(?P<src>[0-9A-Fa-f.:]+(%\w+)?) port \d+` [10m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [4]}   # 5 or more in 10 minutes
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: high
+          mitre: T1110   # Brute Force
+        annotations:
+          summary: '{{ $values.B.Value }} failed SSH logins in 10 min from {{ $labels.src }}'
+          description: 'Real sshd on port 2222 rejected {{ $values.B.Value }} logins from {{ $labels.src }} in the last 10 minutes.'
+
+      # sudo's own audit lines. Note: pi has NOPASSWD sudo, so this catches
+      # other accounts (e.g. one an attacker created), never pi.
+      - uid: host-sudo-failed
+        title: Failed sudo attempt
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 120, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              editorMode: code
+              queryType: instant
+              expr: >-
+                sum by (user, command) (
+                  count_over_time({job="journal", syslog_identifier="sudo"}
+                    |~ "incorrect password attempt|NOT in sudoers|command not allowed"
+                    | regexp `^\s*(?P<user>\S+) : `
+                    | regexp `COMMAND=(?P<command>.*)$` [2m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: high
+          mitre: T1548.003   # Abuse Elevation Control Mechanism: Sudo
+        annotations:
+          summary: 'Failed sudo by {{ $labels.user }}'
+          description: 'user={{ $labels.user }} command={{ $labels.command }}'
+
+      # useradd (also used by adduser) logs one "new user:" line per account.
+      - uid: host-new-user
+        title: New local user account created
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 120, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              editorMode: code
+              queryType: instant
+              expr: >-
+                sum by (new_user, uid) (
+                  count_over_time({job="journal", syslog_identifier="useradd"}
+                    |= "new user:"
+                    | regexp `name=(?P<new_user>[^,]+), UID=(?P<uid>\d+)` [2m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: high
+          mitre: T1136.001   # Create Account: Local Account
+        annotations:
+          summary: 'New user account created: {{ $labels.new_user }}'
+          description: 'user={{ $labels.new_user }} uid={{ $labels.uid }}'
+
+      # soc-diskcheck.timer logs "root_used_pct=N avail_gb=N" every 15 min.
+      - uid: host-disk-filling
+        title: SD card filling up
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              editorMode: code
+              queryType: instant
+              expr: >-
+                max by (host) (
+                  max_over_time({job="journal", syslog_identifier="soc-diskcheck"}
+                    | logfmt | unwrap root_used_pct [30m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [85]}
+        noDataState: OK      # no reading yet just after boot is normal
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'SD card {{ $values.B.Value }}% full on {{ $labels.host }}'
+          description: 'Root filesystem is above 85%. Check Loki data in /srv/soc-data and prune Docker images (docker image prune).'

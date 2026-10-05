@@ -1,0 +1,146 @@
+// Grafana Alloy: collects logs on the Pi and pushes them to Loki.
+//
+//   journal (sshd, sudo, kernel/ufw, systemd) --> drop noise --> Loki
+//   Docker container logs (via socket proxy) ---------------> Loki
+//   OpenCanary event log (JSON) --> parse + label -----------> Loki
+
+// ---------- Systemd journal ----------
+// Auth events live here: this Pi has no rsyslog, so no /var/log/auth.log.
+
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_syslog_identifier"]
+    target_label  = "syslog_identifier"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.source.journal "system" {
+  // journald is volatile here, so the journal starts empty at each boot.
+  // max_age covers a whole day's uptime when Alloy's saved position is stale.
+  path          = "/run/log/journal"
+  max_age       = "12h"
+  relabel_rules = loki.relabel.journal.rules
+  labels        = {job = "journal", host = constants.hostname}
+  forward_to    = [loki.process.journal.receiver]
+}
+
+loki.process "journal" {
+  forward_to = [loki.write.local.receiver]
+
+  // ufw blocks of IGMP (multicast housekeeping from the router): pure noise.
+  stage.drop {
+    expression          = "UFW BLOCK.* PROTO=2 "
+    drop_counter_reason = "igmp_noise"
+  }
+}
+
+// ---------- Docker container logs ----------
+// Talks to the read-only socket proxy, never to docker.sock directly.
+
+discovery.docker "containers" {
+  host             = "tcp://socket-proxy:2375"
+  refresh_interval = "30s"
+}
+
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "tcp://socket-proxy:2375"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  labels        = {job = "docker", host = constants.hostname}
+  forward_to    = [loki.write.local.receiver]
+}
+
+// ---------- OpenCanary decoys ----------
+// One JSON event per line. Labels stay low-cardinality (service, logtype);
+// the source address goes into structured metadata, and usernames/passwords
+// stay in the line for alert rules to pull out with `| json`.
+
+// file_match re-checks every 10s. At boot OpenCanary can create its log a
+// few seconds after Alloy starts, and loki.source.file alone gives up on a
+// path that doesn't exist yet. It also follows the new file after rotation.
+local.file_match "opencanary" {
+  path_targets = [{
+    "__path__" = "/var/log/opencanary/opencanary.log",
+    "job"      = "opencanary",
+    "host"     = constants.hostname,
+  }]
+  sync_period = "10s"
+}
+
+loki.source.file "opencanary" {
+  targets    = local.file_match.opencanary.targets
+  forward_to = [loki.process.opencanary.receiver]
+}
+
+loki.process "opencanary" {
+  forward_to = [loki.write.local.receiver]
+
+  stage.json {
+    expressions = {
+      logtype  = "logtype",
+      dst_port = "dst_port",
+      src_host = "src_host",
+      utc_time = "utc_time",
+    }
+  }
+
+  // Decoy service from the port that was touched; -1 = OpenCanary's own
+  // startup/heartbeat messages (logtype 1000-1006), which alerts ignore.
+  stage.template {
+    source   = "service"
+    template = `{{ if eq .dst_port "21" }}ftp{{ else if eq .dst_port "22" }}ssh{{ else if eq .dst_port "80" }}http{{ else }}opencanary{{ end }}`
+  }
+
+  // Listening on "::" means IPv4 callers appear as ::ffff:a.b.c.d; strip that.
+  stage.replace {
+    source     = "src_host"
+    expression = "^(::ffff:)"
+    replace    = ""
+  }
+
+  stage.labels {
+    values = {logtype = "", service = ""}
+  }
+
+  stage.structured_metadata {
+    values = {src_host = ""}
+  }
+
+  stage.timestamp {
+    source   = "utc_time"
+    format   = "2006-01-02 15:04:05.000000"
+    location = "UTC"
+  }
+}
+
+// ---------- Output ----------
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

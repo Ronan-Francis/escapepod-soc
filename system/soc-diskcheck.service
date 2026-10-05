@@ -1,0 +1,18 @@
+# Install (from the repo root):
+#   sudo install -m 755 system/soc-diskcheck.sh /usr/local/sbin/soc-diskcheck
+#   sudo install -m 644 system/soc-diskcheck.service system/soc-diskcheck.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now soc-diskcheck.timer
+[Unit]
+Description=escapepod-soc: log root filesystem usage to the journal
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/soc-diskcheck
+SyslogIdentifier=soc-diskcheck
+# Only needs to read filesystem stats, so run it with as little as possible.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
